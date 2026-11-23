@@ -1,141 +1,103 @@
-// Drawing only: the world's state and the current screen in, pixels out. The 1280x720 playfield
-// is scaled to fit the window and centred, the margin filled with the backdrop colour. Flat
-// rectangles and circles, canvas text for the HUD and the panels. Text that holds a number is
-// rebuilt only when the number changes, so a frame allocates nothing.
-import { FIELD, FONT, LIVES, PALETTE } from './config.js';
-import { KIND_COIN } from './world.js';
+// Marisol Heat — render: three.js night scene, camera rig, minimap, markers.
+import * as THREE from 'three';
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_OVER = 'over';
+export class Renderer {
+  constructor(canvas) {
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x050510);
+    this.scene.fog = new THREE.Fog(0x070714, 90, 320);
+    this.camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 900);
+    // Night lighting: dim moon + warm ambient + neon-ish hemisphere
+    this.scene.add(new THREE.AmbientLight(0x334, 0.7));
+    const moon = new THREE.DirectionalLight(0x8fb4ff, 0.9);
+    moon.position.set(-120, 180, -60); this.scene.add(moon);
+    const hemi = new THREE.HemisphereLight(0x2a1a4a, 0x05050a, 0.8);
+    this.scene.add(hemi);
+    // Moon disc
+    const moonMesh = new THREE.Mesh(new THREE.CircleGeometry(14, 24), new THREE.MeshBasicMaterial({ color: 0xe8f0ff }));
+    moonMesh.position.set(-220, 170, -260); moonMesh.lookAt(0, 0, 0); this.scene.add(moonMesh);
+    // Objective marker: floating gold beacon
+    const markerGeo = new THREE.CylinderGeometry(0.2, 0.2, 26, 8);
+    this.marker = new THREE.Mesh(markerGeo, new THREE.MeshBasicMaterial({ color: 0xffd60a, transparent: true, opacity: 0.55 }));
+    this.marker.visible = false; this.scene.add(this.marker);
+    this.markerRing = new THREE.Mesh(new THREE.TorusGeometry(3, 0.25, 8, 32),
+      new THREE.MeshBasicMaterial({ color: 0xffd60a }));
+    this.markerRing.rotation.x = Math.PI / 2; this.markerRing.visible = false; this.scene.add(this.markerRing);
+    // Headlight for the player car
+    this.headlight = new THREE.SpotLight(0xfff2c0, 60, 70, 0.6, 0.5, 1.2);
+    this.scene.add(this.headlight);
+    this.headlightTarget = new THREE.Object3D(); this.scene.add(this.headlightTarget);
+    this.headlight.target = this.headlightTarget;
+    window.addEventListener('resize', () => {
+      this.camera.aspect = window.innerWidth / window.innerHeight;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  }
 
-/** The panel's width; its height grows with its lines: room for the title, the lines and the prompt. */
-const PANEL = { width: 600, top: 134, line: 34, bottom: 70 };
-const LIFE_SIZE = 20;
-const LIFE_GAP = 8;
+  follow(px, pz, angle, driving, tick) {
+    const dist = driving ? 13 : 9;
+    const h = driving ? 5.5 : 4.5;
+    const bx = px - Math.sin(angle) * dist;
+    const bz = pz - Math.cos(angle) * dist;
+    this.camera.position.set(bx, h, bz);
+    this.camera.lookAt(px + Math.sin(angle) * 6, 1.5, pz + Math.cos(angle) * 6);
+    // subtle bob while on foot
+    if (!driving) this.camera.position.y += Math.sin(tick * 0.1) * 0.05;
+  }
 
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+  setMarker(x, z, visible, tick) {
+    this.marker.visible = visible; this.markerRing.visible = visible;
+    if (!visible) return;
+    this.marker.position.set(x, 13, z);
+    this.markerRing.position.set(x, 0.3, z);
+    this.markerRing.scale.setScalar(1 + Math.sin(tick * 0.08) * 0.15);
+    this.marker.material.opacity = 0.4 + Math.sin(tick * 0.08) * 0.15;
+  }
+
+  setHeadlight(x, z, angle, on) {
+    this.headlight.visible = on;
+    if (!on) return;
+    this.headlight.position.set(x, 2.2, z);
+    this.headlightTarget.position.set(x + Math.sin(angle) * 20, 0.5, z + Math.cos(angle) * 20);
+  }
+
+  render() { this.renderer.render(this.scene, this.camera); }
 }
 
-export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('Score ');
-  const levelLabel = cachedLabel('Level ');
-  const finalLabel = cachedLabel('Score ');
-  const bestLabel = cachedLabel('Best ');
-
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
+// 2D minimap drawn on a canvas: streets, districts, player, cops, marker.
+export function drawMinimap(ctx, size, state) {
+  const S = size, W = 440;
+  const toMap = (x, z) => [(x + W / 2) / W * S, (z + W / 2) / W * S];
+  ctx.clearRect(0, 0, S, S);
+  ctx.fillStyle = 'rgba(8,8,18,0.85)'; ctx.fillRect(0, 0, S, S);
+  ctx.strokeStyle = 'rgba(120,120,160,0.5)'; ctx.lineWidth = 1;
+  for (let i = -5; i <= 5; i++) {
+    const p = toMap(i * 42, 0)[0];
+    ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, S); ctx.stroke();
+    const q = toMap(0, i * 42)[1];
+    ctx.beginPath(); ctx.moveTo(0, q); ctx.lineTo(S, q); ctx.stroke();
   }
-
-  const fonts = new Map();
-  function text(value, x, y, size, color, align) {
-    if (!fonts.has(size)) fonts.set(size, `${size}px ${FONT}`);
-    context.font = fonts.get(size);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
+  // ocean
+  ctx.fillStyle = 'rgba(10,60,100,0.8)';
+  const ox = toMap(210, 0)[0]; ctx.fillRect(ox, 0, S - ox, S);
+  // objective marker
+  if (state.marker) {
+    const [mx, mz] = toMap(state.marker[0], state.marker[1]);
+    ctx.fillStyle = '#ffd60a';
+    ctx.beginPath(); ctx.arc(mx, mz, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#ffd60a'; ctx.beginPath(); ctx.arc(mx, mz, 9, 0, Math.PI * 2); ctx.stroke();
   }
-
-  function drawField(state) {
-    context.fillStyle = PALETTE.sky;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.fillStyle = PALETTE.ground;
-    context.fillRect(0, FIELD.groundY, FIELD.width, FIELD.height - FIELD.groundY);
-
-    const items = state.items;
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      if (item.kind === KIND_COIN) {
-        context.fillStyle = PALETTE.coin;
-        context.beginPath();
-        context.arc(item.x + item.width / 2, item.y + item.height / 2, item.width / 2, 0, Math.PI * 2);
-        context.fill();
-      } else {
-        context.fillStyle = PALETTE.block;
-        context.fillRect(item.x, item.y, item.width, item.height);
-      }
-    }
-
-    const player = state.player;
-    // Blink while invulnerable after a hit: hidden on every other tenth of a second.
-    if (player.invulnerable === 0 || Math.floor(player.invulnerable * 10) % 2 === 1) {
-      context.fillStyle = PALETTE.player;
-      context.fillRect(player.x, player.y, player.width, player.height);
-    }
-  }
-
-  function drawHud(state) {
-    context.textBaseline = 'top';
-    text(scoreLabel(state.score), 24, 20, 28, PALETTE.text, 'left');
-    text(levelLabel(state.level), FIELD.width / 2, 20, 28, PALETTE.text, 'center');
-    const firstLife = FIELD.width - 24 - LIVES * (LIFE_SIZE + LIFE_GAP) + LIFE_GAP;
-    text('Lives', firstLife - 12, 20, 28, PALETTE.text, 'right');
-    for (let life = 0; life < LIVES; life += 1) {
-      context.fillStyle = life < state.lives ? PALETTE.player : PALETTE.ground;
-      context.fillRect(firstLife + life * (LIFE_SIZE + LIFE_GAP), 24, LIFE_SIZE, LIFE_SIZE);
-    }
-  }
-
-  function drawPanel(title, lines, prompt) {
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, PANEL.width, height);
-    context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 78, 48, PALETTE.text, 'center');
-    for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 22, PALETTE.muted, 'center');
-    }
-    text(prompt, FIELD.width / 2, y + height - 40, 24, PALETTE.coin, 'center');
-  }
-
-  const TITLE_LINES = ['Dodge the red blocks. Catch the gold coins.', 'Move with ← → or A D.  Pause with P.', ''];
-  const PAUSED_LINES = ['The blocks will wait for you.'];
-  const OVER_LINES = ['', ''];
-
-  /** Paint one frame: the field, then the HUD or a panel for the screen the game is on. */
-  function draw(state, screen, best) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawField(state);
-    if (screen === SCREEN_TITLE) {
-      TITLE_LINES[2] = bestLabel(best);
-      drawPanel('Block Dodger', TITLE_LINES, 'Press Space or click to start');
-      return;
-    }
-    drawHud(state);
-    if (screen === SCREEN_PAUSED) drawPanel('Paused', PAUSED_LINES, 'Press P to resume');
-    else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      drawPanel('Game over', OVER_LINES, 'Press Space or click to play again');
-    }
-  }
-
-  resize();
-  window.addEventListener('resize', resize);
-  return { draw };
+  // cops (blue/red dots)
+  ctx.fillStyle = '#3b82f6';
+  for (const c of state.cops || []) { const [cx, cz] = toMap(c.x, c.z); ctx.fillRect(cx - 2, cz - 2, 4, 4); }
+  // player arrow
+  const [px, pz] = toMap(state.px, state.pz);
+  ctx.save(); ctx.translate(px, pz); ctx.rotate(-state.angle + Math.PI);
+  ctx.fillStyle = '#fff'; ctx.beginPath();
+  ctx.moveTo(0, -6); ctx.lineTo(4, 5); ctx.lineTo(-4, 5); ctx.closePath(); ctx.fill();
+  ctx.restore();
 }
